@@ -31,6 +31,30 @@ $OUClientMapping = @{
 # Define the AD search base (adjust to your domain structure)
 $ADSearchBase = "DC=yourdomain,DC=com"
 
+# Define log file path
+$LogFilePath = ".\Sync-ADContactsToITFlow.log"
+
+# -----------------------------
+# Logging Function
+# -----------------------------
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [ValidateSet("INFO", "WARNING", "ERROR")]
+        [string]$Level = "INFO"
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "$timestamp [$Level] $Message"
+
+    # Write to console
+    Write-Output $logMessage
+
+    # Append to log file
+    Add-Content -Path $LogFilePath -Value $logMessage
+}
+
 # -----------------------------
 # Functions
 # -----------------------------
@@ -42,12 +66,14 @@ function Get-ITFlowContact {
         [string]$Email
     )
     $uri = "$ITFlowApiUrl/contacts?email=$($Email)"
+    Write-Log "Retrieving ITFlow contact for email '$Email' using URI: $uri" "INFO"
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Get -Headers @{ "X-API-Key" = $ITFlowApiKey }
+        Write-Log "Successfully retrieved contact for '$Email'" "INFO"
         return $response
     }
     catch {
-        Write-Warning "Error retrieving ITFlow contact for email '$Email': $_"
+        Write-Log "Error retrieving ITFlow contact for email '$Email': $_" "ERROR"
         return $null
     }
 }
@@ -59,16 +85,17 @@ function Create-ITFlowContact {
         [hashtable]$ContactData
     )
     $uri = "$ITFlowApiUrl/contacts"
+    Write-Log "Creating ITFlow contact for '$($ContactData.email)' with data: $(ConvertTo-Json $ContactData)" "INFO"
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Post `
                      -Headers @{ "X-API-Key" = $ITFlowApiKey } `
                      -Body ($ContactData | ConvertTo-Json -Depth 5) `
                      -ContentType "application/json"
-        Write-Output "Created contact: $($ContactData.name)"
+        Write-Log "Created contact: $($ContactData.name)" "INFO"
         return $response
     }
     catch {
-        Write-Warning "Error creating ITFlow contact for '$($ContactData.email)': $_"
+        Write-Log "Error creating ITFlow contact for '$($ContactData.email)': $_" "ERROR"
         return $null
     }
 }
@@ -82,16 +109,17 @@ function Update-ITFlowContact {
         [hashtable]$ContactData
     )
     $uri = "$ITFlowApiUrl/contacts/$ContactId"
+    Write-Log "Updating ITFlow contact (ID: $ContactId) for '$($ContactData.email)' with data: $(ConvertTo-Json $ContactData)" "INFO"
     try {
         $response = Invoke-RestMethod -Uri $uri -Method Put `
                      -Headers @{ "X-API-Key" = $ITFlowApiKey } `
                      -Body ($ContactData | ConvertTo-Json -Depth 5) `
                      -ContentType "application/json"
-        Write-Output "Updated contact: $($ContactData.name)"
+        Write-Log "Updated contact: $($ContactData.name)" "INFO"
         return $response
     }
     catch {
-        Write-Warning "Error updating ITFlow contact for '$($ContactData.email)': $_"
+        Write-Log "Error updating ITFlow contact for '$($ContactData.email)': $_" "ERROR"
         return $null
     }
 }
@@ -102,11 +130,14 @@ function Get-ClientIdFromOU {
         [Parameter(Mandatory)]
         [string]$DistinguishedName
     )
+    Write-Log "Determining client ID for DN: $DistinguishedName" "INFO"
     foreach ($ouKey in $OUClientMapping.Keys) {
         if ($DistinguishedName -like "*$ouKey*") {
+            Write-Log "Matched OU '$ouKey' to client ID: $($OUClientMapping[$ouKey])" "INFO"
             return $OUClientMapping[$ouKey]
         }
     }
+    Write-Log "No client mapping found for DN: $DistinguishedName" "WARNING"
     return $null
 }
 
@@ -114,29 +145,34 @@ function Get-ClientIdFromOU {
 # Main Script Execution
 # -----------------------------
 
+Write-Log "Script execution started." "INFO"
+
 # Ensure the ActiveDirectory module is available
 if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-    Write-Error "The ActiveDirectory module is not available. Please install RSAT tools."
+    Write-Log "The ActiveDirectory module is not available. Please install RSAT tools." "ERROR"
     exit 1
 }
 Import-Module ActiveDirectory
+Write-Log "ActiveDirectory module imported successfully." "INFO"
 
 # Retrieve Active Directory users.
-# (Use Get-ADUser or Get-ADContact as needed. Adjust the properties as required.)
 try {
+    Write-Log "Querying Active Directory users from search base: $ADSearchBase" "INFO"
     $ADUsers = Get-ADUser -Filter { Enabled -eq $true } -SearchBase $ADSearchBase `
                 -Properties DisplayName, EmailAddress, Title, Department, DistinguishedName
+    Write-Log "Retrieved $($ADUsers.Count) users from Active Directory." "INFO"
 }
 catch {
-    Write-Error "Error retrieving AD users: $_"
+    Write-Log "Error retrieving AD users: $_" "ERROR"
     exit 1
 }
 
 foreach ($adUser in $ADUsers) {
+    Write-Log "Processing AD user: $($adUser.DisplayName)" "INFO"
     # Determine the ITFlow Client based on the user's OU
     $clientId = Get-ClientIdFromOU -DistinguishedName $adUser.DistinguishedName
     if (-not $clientId) {
-        Write-Warning "No client mapping found for '$($adUser.DisplayName)' (DN: $($adUser.DistinguishedName)). Skipping..."
+        Write-Log "No client mapping found for user '$($adUser.DisplayName)'. Skipping..." "WARNING"
         continue
     }
     
@@ -151,7 +187,7 @@ foreach ($adUser in $ADUsers) {
     }
     
     if (-not $contactData.email) {
-        Write-Warning "No email address found for '$($adUser.DisplayName)'. Skipping contact."
+        Write-Log "No email address found for '$($adUser.DisplayName)'. Skipping contact." "WARNING"
         continue
     }
 
@@ -159,11 +195,13 @@ foreach ($adUser in $ADUsers) {
     $existingContact = Get-ITFlowContact -Email $contactData.email
 
     if ($existingContact -and $existingContact.id) {
-        # Update the existing contact
+        Write-Log "Contact exists in ITFlow (ID: $($existingContact.id)). Proceeding with update." "INFO"
         Update-ITFlowContact -ContactId $existingContact.id -ContactData $contactData
     }
     else {
-        # Create a new contact
+        Write-Log "No existing contact found for '$($adUser.EmailAddress)'. Proceeding with creation." "INFO"
         Create-ITFlowContact -ContactData $contactData
     }
 }
+
+Write-Log "Script execution completed." "INFO"
