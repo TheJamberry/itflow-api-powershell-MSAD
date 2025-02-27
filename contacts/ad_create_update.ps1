@@ -1,207 +1,240 @@
-# ==============================================================================
-# Description:
-#   Retrieves user data from Active Directory and synchronizes it with the
-#   ITFlow API. For each AD user, the script determines an ITFlow client based
-#   on the OU (found in the DistinguishedName) and then either creates or
-#   updates the contact record in ITFlow.
-#
-# Requirements:
-#   - RSAT / ActiveDirectory PowerShell module
-#   - Valid ITFlow API endpoint and API key
-#
-# Customize the configuration section below to suit your environment.
-# ==============================================================================
-
-# -----------------------------
-# Configuration
-# -----------------------------
-$ITFlowApiKey = "YOUR_ITFLOW_API_KEY"                          # Replace with your ITFlow API key
-$ITFlowApiUrl = "https://itflow.company.com/api/v1"   # Replace with your ITFlow API base URL
-
-# Define OU-to-client mapping.
-# Keys are substrings you expect in the AD DistinguishedName.
-# Values are the corresponding ITFlow Client IDs.
-$OUClientMapping = @{
-    "OU=Sales"   = 101;   # ITFlow client ID for Sales
-    "OU=Support" = 102;   # ITFlow client ID for Support
-    "OU=IT"      = 103;   # ITFlow client ID for IT
-    # Add additional OU mappings as needed.
+# Import the ActiveDirectory module if not already imported
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    Write-Host "ActiveDirectory module is required. Please install it."
+    exit
 }
 
-# Define the AD search base (adjust to your domain structure)
-$ADSearchBase = "DC=yourdomain,DC=com"
+# ITFlow API settings
+$itflowUrl = "https://your-itflow-instance.example.com/api/v1"   # Update as needed
+$apiKey = "YOUR_API_KEY_HERE"  # Replace with your API key
 
-# Define log file path
-$LogFilePath = ".\Sync-ADContactsToITFlow.log"
+# Set the AD search base for contacts (update for your environment)
+$contactsOU = "OU=Contacts,DC=example,DC=com"
 
-# -----------------------------
-# Logging Function
-# -----------------------------
+# Define log file and exclusion file paths
+$logFile = "C:\Logs\ITFlowContactSync.log"
+$exclusionFile = "C:\Logs\ITFlowContactExclusions.txt"
+
+# Ensure log directory exists
+$logDir = Split-Path -Path $logFile -Parent
+if (-not (Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir | Out-Null
+}
+
+# Function to get the exclusion list (contacts not to process)
+function Get-ExcludedContacts {
+    if (Test-Path $exclusionFile) {
+        return Get-Content $exclusionFile
+    }
+    return @()
+}
+
+# Function to add a contact email to the exclusion list
+function Add-ExcludedContact {
+    param([string]$contactEmail)
+    if (-not ((Get-ExcludedContacts) -contains $contactEmail)) {
+        Add-Content -Path $exclusionFile -Value $contactEmail
+    }
+}
+
+# Centralized logging function
 function Write-Log {
-    param(
-        [Parameter(Mandatory = $true)]
+    param (
         [string]$Message,
-        [ValidateSet("INFO", "WARNING", "ERROR")]
         [string]$Level = "INFO"
     )
-
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "$timestamp [$Level] $Message"
-
-    # Write to console
-    Write-Output $logMessage
-
-    # Append to log file
-    Add-Content -Path $LogFilePath -Value $logMessage
+    $logMessage = "[$timestamp] [$Level] $Message"
+    Write-Host $logMessage
+    Add-Content -Path $logFile -Value $logMessage
 }
 
-# -----------------------------
-# Functions
-# -----------------------------
+Write-Log "Script started."
 
-function Get-ITFlowContact {
-    [CmdletBinding()]
+# Function to query ITFlow for a specific contact by email
+function Get-ITFlowContactByEmail {
     param(
-        [Parameter(Mandatory)]
-        [string]$Email
+         [string]$Email,
+         [string]$ApiUrl,
+         [string]$ApiKey
     )
-    $uri = "$ITFlowApiUrl/contacts?email=$($Email)"
-    Write-Log "Retrieving ITFlow contact for email '$Email' using URI: $uri" "INFO"
+    $uri = "$ApiUrl/contacts/read.php?api_key=$ApiKey&contact_email=$Email"
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers @{ "X-API-Key" = $ITFlowApiKey }
-        Write-Log "Successfully retrieved contact for '$Email'" "INFO"
-        return $response
+         $response = Invoke-RestMethod -Method Get -Uri $uri
+         Write-Log "Retrieved ITFlow contact data for $Email."
+         return $response.data
+    } catch {
+         Write-Log "Error fetching ITFlow contact for ${Email}: $_" "ERROR"
+         return $null
     }
-    catch {
-        Write-Log "Error retrieving ITFlow contact for email '$Email': $_" "ERROR"
+}
+
+# Function to get all clients from ITFlow
+function Get-ITFlowClients {
+    param (
+        [string]$ApiUrl,
+        [string]$ApiKey
+    )
+    $uri = "$ApiUrl/clients/read.php?api_key=$ApiKey"
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Get
+        Write-Log "Successfully retrieved clients from ITFlow."
+        return $response.data
+    } catch {
+        Write-Log "Error fetching ITFlow clients: $_" "ERROR"
         return $null
     }
 }
 
-function Create-ITFlowContact {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [hashtable]$ContactData
-    )
-    $uri = "$ITFlowApiUrl/contacts"
-    Write-Log "Creating ITFlow contact for '$($ContactData.email)' with data: $(ConvertTo-Json $ContactData)" "INFO"
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method Post `
-                     -Headers @{ "X-API-Key" = $ITFlowApiKey } `
-                     -Body ($ContactData | ConvertTo-Json -Depth 5) `
-                     -ContentType "application/json"
-        Write-Log "Created contact: $($ContactData.name)" "INFO"
-        return $response
-    }
-    catch {
-        Write-Log "Error creating ITFlow contact for '$($ContactData.email)': $_" "ERROR"
-        return $null
-    }
-}
-
-function Update-ITFlowContact {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$ContactId,
-        [Parameter(Mandatory)]
-        [hashtable]$ContactData
-    )
-    $uri = "$ITFlowApiUrl/contacts/$ContactId"
-    Write-Log "Updating ITFlow contact (ID: $ContactId) for '$($ContactData.email)' with data: $(ConvertTo-Json $ContactData)" "INFO"
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method Put `
-                     -Headers @{ "X-API-Key" = $ITFlowApiKey } `
-                     -Body ($ContactData | ConvertTo-Json -Depth 5) `
-                     -ContentType "application/json"
-        Write-Log "Updated contact: $($ContactData.name)" "INFO"
-        return $response
-    }
-    catch {
-        Write-Log "Error updating ITFlow contact for '$($ContactData.email)': $_" "ERROR"
-        return $null
-    }
-}
-
-function Get-ClientIdFromOU {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$DistinguishedName
-    )
-    Write-Log "Determining client ID for DN: $DistinguishedName" "INFO"
-    foreach ($ouKey in $OUClientMapping.Keys) {
-        if ($DistinguishedName -like "*$ouKey*") {
-            Write-Log "Matched OU '$ouKey' to client ID: $($OUClientMapping[$ouKey])" "INFO"
-            return $OUClientMapping[$ouKey]
-        }
-    }
-    Write-Log "No client mapping found for DN: $DistinguishedName" "WARNING"
-    return $null
-}
-
-# -----------------------------
-# Main Script Execution
-# -----------------------------
-
-Write-Log "Script execution started." "INFO"
-
-# Ensure the ActiveDirectory module is available
-if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-    Write-Log "The ActiveDirectory module is not available. Please install RSAT tools." "ERROR"
-    exit 1
-}
-Import-Module ActiveDirectory
-Write-Log "ActiveDirectory module imported successfully." "INFO"
-
-# Retrieve Active Directory users.
+# Get AD contacts from the specified OU
 try {
-    Write-Log "Querying Active Directory users from search base: $ADSearchBase" "INFO"
-    $ADUsers = Get-ADUser -Filter { Enabled -eq $true } -SearchBase $ADSearchBase `
-                -Properties DisplayName, EmailAddress, Title, Department, DistinguishedName
-    Write-Log "Retrieved $($ADUsers.Count) users from Active Directory." "INFO"
-}
-catch {
-    Write-Log "Error retrieving AD users: $_" "ERROR"
-    exit 1
+    $adContacts = Get-ADUser -Filter * -SearchBase $contactsOU -Properties displayName, title, department, mail, telephoneNumber, mobile, ipPhone, DistinguishedName
+    Write-Log "Retrieved $($adContacts.Count) AD contacts from $contactsOU."
+} catch {
+    Write-Log "Error querying AD contacts: $_" "ERROR"
+    exit
 }
 
-foreach ($adUser in $ADUsers) {
-    Write-Log "Processing AD user: $($adUser.DisplayName)" "INFO"
-    # Determine the ITFlow Client based on the user's OU
-    $clientId = Get-ClientIdFromOU -DistinguishedName $adUser.DistinguishedName
-    if (-not $clientId) {
-        Write-Log "No client mapping found for user '$($adUser.DisplayName)'. Skipping..." "WARNING"
+# Initialize arrays for processed contacts
+$existingContacts = @()
+$newContacts = @()
+
+# Process each AD contact
+foreach ($adContact in $adContacts) {
+    if ($adContact.mail) {
+        $itflowContactData = Get-ITFlowContactByEmail -Email $adContact.mail -ApiUrl $itflowUrl -ApiKey $apiKey
+        if ($itflowContactData -and (($itflowContactData -is [array] -and $itflowContactData.Count -gt 0) -or ($itflowContactData -isnot [array]))) {
+            # If the contact exists in ITFlow, update its details.
+            if ($itflowContactData -is [array]) {
+                $itflowContact = $itflowContactData[0]
+            } else {
+                $itflowContact = $itflowContactData
+            }
+            
+            # Use AD's ipPhone for the contact extension (if available)
+            $extension = if ($adContact.ipPhone) { $adContact.ipPhone } else { "" }
+            
+            # Process phone numbers: replace a leading +61 with 00
+            $phoneNumber = if ($adContact.telephoneNumber -match "^\+61") { $adContact.telephoneNumber -replace "^\+61", "00" } else { $adContact.telephoneNumber }
+            $mobileNumber = if ($adContact.mobile -match "^\+61") { $adContact.mobile -replace "^\+61", "00" } else { $adContact.mobile }
+            
+            # Build JSON payload for update (following ITFlow sample format)
+            $body = @"
+{
+    "api_key" : "$apiKey",
+    "contact_id" : "$($itflowContact.contact_id)",
+    "contact_name" : "$($adContact.displayName)",
+    "contact_title" : "$($adContact.title)",
+    "contact_department" : "$($adContact.department)",
+    "contact_email" : "$($adContact.mail)",
+    "contact_phone" : "$phoneNumber",
+    "contact_extension" : "$extension",
+    "contact_mobile" : "$mobileNumber",
+    "contact_notes" : "",
+    "contact_auth_method" : "",
+    "contact_important" : "",
+    "contact_billing" : "",
+    "contact_technical" : "",
+    "contact_location_id" : "",
+    "client_id" : "$($itflowContact.contact_client_id)"
+}
+"@
+            $uri = "$itflowUrl/contacts/update.php"
+            try {
+                Write-Log "Updating contact with payload: $body"
+                Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" | Out-Null
+                Write-Log "Updated contact: $($adContact.displayName)"
+                $existingContacts += $adContact
+            } catch {
+                Write-Log "Error updating contact $($adContact.displayName): $_" "ERROR"
+            }
+        } else {
+            # If the contact does not exist in ITFlow, add to new contacts list.
+            Write-Log "New contact found: $($adContact.displayName)"
+            $newContacts += $adContact
+        }
+    } else {
+        Write-Log "AD contact '$($adContact.displayName)' has no email address. Skipping." "WARNING"
+    }
+}
+
+# Retrieve ITFlow clients for allocation
+$clients = Get-ITFlowClients -ApiUrl $itflowUrl -ApiKey $apiKey
+if (-not $clients) {
+    Write-Log "Failed to retrieve ITFlow clients. New contacts will not be created." "ERROR"
+    exit
+}
+
+# Process each new contact
+foreach ($newContact in $newContacts) {
+    # Check exclusion list so that we don't repeatedly prompt about the same contact.
+    $excludedList = Get-ExcludedContacts
+    if ($newContact.mail -and ($excludedList -contains $newContact.mail)) {
+        Write-Log "Skipping new contact $($newContact.displayName) as it is in the exclusion list."
         continue
     }
-    
-    # Build the contact data for ITFlow
-    $contactData = @{
-        name       = $adUser.DisplayName
-        email      = $adUser.EmailAddress
-        title      = $adUser.Title
-        department = $adUser.Department
-        clientId   = $clientId
-        # Add any additional fields required by your ITFlow API here.
+
+    Write-Log "Processing new contact: $($newContact.displayName), $($newContact.mail)"
+    $clientId = $null
+
+    # Always prompt for client allocation (no auto-assignment)
+    Write-Host "Allocate contact '$($newContact.displayName)' ($($newContact.mail)) to a client. Select an option:"
+    Write-Host "0. Do not create this contact"
+    for ($i = 0; $i -lt $clients.Count; $i++) {
+        Write-Host "$($i + 1). $($clients[$i].client_name)"
     }
-    
-    if (-not $contactData.email) {
-        Write-Log "No email address found for '$($adUser.DisplayName)'. Skipping contact." "WARNING"
+    do {
+        $selection = Read-Host "Enter the number of the client (0-$($clients.Count))"
+        $valid = $selection -match '^\d+$' -and [int]$selection -ge 0 -and [int]$selection -le $clients.Count
+        if (-not $valid) {
+            Write-Host "Invalid selection. Please enter a number between 0 and $($clients.Count)."
+        }
+    } while (-not $valid)
+
+    if ([int]$selection -eq 0) {
+        Write-Log "User opted to not create the contact: $($newContact.displayName)"
+        if ($newContact.mail) { Add-ExcludedContact -contactEmail $newContact.mail }
         continue
+    } else {
+        $clientId = $clients[$selection - 1].client_id
+        Write-Log "User selected client ID: $clientId for contact: $($newContact.displayName)"
     }
 
-    # Check if this contact already exists in ITFlow (lookup by email)
-    $existingContact = Get-ITFlowContact -Email $contactData.email
+    # Process phone numbers: replace +61 with 00
+    $phoneNumber = if ($newContact.telephoneNumber -match "^\+61") { $newContact.telephoneNumber -replace "^\+61", "00" } else { $newContact.telephoneNumber }
+    $mobileNumber = if ($newContact.mobile -match "^\+61") { $newContact.mobile -replace "^\+61", "00" } else { $newContact.mobile }
+    
+    # Get extension from AD's ipPhone attribute
+    $extension = if ($newContact.ipPhone) { $newContact.ipPhone } else { "" }
 
-    if ($existingContact -and $existingContact.id) {
-        Write-Log "Contact exists in ITFlow (ID: $($existingContact.id)). Proceeding with update." "INFO"
-        Update-ITFlowContact -ContactId $existingContact.id -ContactData $contactData
-    }
-    else {
-        Write-Log "No existing contact found for '$($adUser.EmailAddress)'. Proceeding with creation." "INFO"
-        Create-ITFlowContact -ContactData $contactData
+    # Build JSON payload for new contact creation (using ITFlow sample format)
+    $body = @"
+{
+    "api_key" : "$apiKey",
+    "contact_name" : "$($newContact.displayName)",
+    "contact_title" : "$($newContact.title)",
+    "contact_department" : "$($newContact.department)",
+    "contact_email" : "$($newContact.mail)",
+    "contact_phone" : "$phoneNumber",
+    "contact_extension" : "$extension",
+    "contact_mobile" : "$mobileNumber",
+    "contact_notes" : "",
+    "contact_auth_method" : "local",
+    "contact_important" : "0",
+    "contact_billing" : "1",
+    "contact_technical" : "0",
+    "contact_location_id" : "0",
+    "client_id" : "$clientId"
+}
+"@
+    $uri = "$itflowUrl/contacts/create.php"
+    try {
+        Write-Log "Creating contact with payload: $body"
+        Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType "application/json" | Out-Null
+        Write-Log "Created contact: $($newContact.displayName) for client ID: $clientId"
+    } catch {
+        Write-Log "Error creating contact $($newContact.displayName): $_" "ERROR"
     }
 }
 
-Write-Log "Script execution completed." "INFO"
+Write-Log "Script completed successfully."
